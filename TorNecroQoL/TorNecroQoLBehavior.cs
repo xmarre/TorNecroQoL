@@ -42,7 +42,6 @@ namespace TorNecroQoL
                 var gmm = Campaign.Current != null ? Campaign.Current.GameMenuManager : null;
                 if (gmm == null) return;
 
-                // GameMenuManager usually holds a Dictionary<string, GameMenu> named "_gameMenus" or "GameMenus"
                 var dict = GetMenusDictionary(gmm);
                 if (dict == null) return;
 
@@ -51,25 +50,29 @@ namespace TorNecroQoL
                     var menu = kv.Value;
                     if (menu == null) continue;
 
-                    // quick filter by id/name text
                     var id = menu.StringId ?? "";
-                    var text = menu.Text != null ? menu.Text.ToString() : "";
-                    bool looksLikeGraveyard = id.IndexOf("grave", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                              text.IndexOf("grave", StringComparison.OrdinalIgnoreCase) >= 0;
-                    if (!looksLikeGraveyard) continue;
 
-                    // get options list
                     var options = GetMenuOptions(menu);
                     if (options == null) continue;
+
+                    bool looksLikeGraveyard =
+                        id.IndexOf("grave", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        options.Any(o =>
+                        {
+                            var t = GetOptionText(o);
+                            return t.IndexOf("grave", StringComparison.OrdinalIgnoreCase) >= 0;
+                        });
+
+                    if (!looksLikeGraveyard) continue;
 
                     for (int i = 0; i < options.Count; i++)
                     {
                         var opt = options[i];
                         if (opt == null) continue;
+
                         var label = GetOptionText(opt);
                         var optId = GetOptionId(opt);
 
-                        // Heuristic: option that contains "raise" and "corpse" or has an id with "raise"
                         bool isRaise =
                             (label.IndexOf("raise", StringComparison.OrdinalIgnoreCase) >= 0 &&
                              (label.IndexOf("corpse", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -79,7 +82,6 @@ namespace TorNecroQoL
 
                         if (!isRaise) continue;
 
-                        // Swap consequence delegate
                         var consType = opt.GetType().GetField("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.FieldType
                                        ?? opt.GetType().GetProperty("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.PropertyType;
                         var myMi = GetType().GetMethod(nameof(InjectedGraveyardRaiseConsequence), BindingFlags.Instance | BindingFlags.NonPublic);
@@ -87,7 +89,6 @@ namespace TorNecroQoL
                         {
                             var del = Delegate.CreateDelegate(consType, this, myMi);
                             SetOptionConsequence(opt, del);
-                            // Done: first matching option replaced
                             return;
                         }
                     }
