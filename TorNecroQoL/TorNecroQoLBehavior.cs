@@ -21,6 +21,7 @@ namespace TorNecroQoL
         // enable to print exact gates that block graveyard raising
         private const bool DEBUG_RAISE_DIAGNOSTICS = false;
         private bool _graveyardPatched;
+        private Delegate _torOriginalRaiseConsequence;
 
         public override void RegisterEvents()
         {
@@ -82,6 +83,9 @@ namespace TorNecroQoL
 
                         if (!isTorRaise) continue;
 
+                        if (_torOriginalRaiseConsequence == null)
+                            _torOriginalRaiseConsequence = del;
+
                         var consType =
                             opt.GetType().GetField("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.FieldType
                             ?? opt.GetType().GetProperty("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.PropertyType;
@@ -106,26 +110,69 @@ namespace TorNecroQoL
         }
 
         // Called when player presses the existing TOR "raise" option
-        private void InjectedGraveyardRaiseConsequence(MenuCallbackArgs _)
+        private void InjectedGraveyardRaiseConsequence(MenuCallbackArgs args)
         {
             _graveyardPatched = true;
             var s = Settlement.CurrentSettlement;
-            if (s == null) return;
+            var party = MobileParty.MainParty;
+            if (s == null || party == null) return;
 
-            var raised = TorCoreApi.TryCalculateRaiseDeadTroopsFromGraveyard(s, MobileParty.MainParty);
-            if (raised == null || raised.TotalManCount == 0)
+            var before = new Dictionary<CharacterObject, int>();
+            var br = party.MemberRoster.GetTroopRoster();
+            for (int i = 0; i < br.Count; i++)
+            {
+                var e = br[i];
+                if (e.Character != null && e.Number > 0)
+                    before[e.Character] = e.Number;
+            }
+
+            var orig = _torOriginalRaiseConsequence;
+            if (orig != null)
+            {
+                orig.DynamicInvoke(args);
+            }
+            else
+            {
+                var fallback = TorCoreApi.TryCalculateRaiseDeadTroopsFromGraveyard(s, party);
+                if (fallback == null || fallback.TotalManCount == 0)
+                {
+                    if (DEBUG_RAISE_DIAGNOSTICS) TorCoreApi.DumpGraveyardRaiseDiagnostics(s);
+                    MBInformationManager.AddQuickInformation(new TextObject("{=tor_none_to_raise}No corpses answer your call."));
+                    return;
+                }
+
+                var fl = fallback.GetTroopRoster();
+                for (int i = 0; i < fl.Count; i++)
+                {
+                    var e = fl[i];
+                    if (e.Character != null && e.Number > 0)
+                        party.MemberRoster.AddToCounts(e.Character, e.Number);
+                }
+            }
+
+            var delta = TroopRoster.CreateDummyTroopRoster();
+            var ar = party.MemberRoster.GetTroopRoster();
+            for (int i = 0; i < ar.Count; i++)
+            {
+                var e = ar[i];
+                if (e.Character == null) continue;
+                int beforeCount = before.TryGetValue(e.Character, out var b) ? b : 0;
+                int added = e.Number - beforeCount;
+                if (added > 0) delta.AddToCounts(e.Character, added);
+            }
+
+            if (delta.TotalManCount <= 0)
             {
                 MBInformationManager.AddQuickInformation(new TextObject("{=tor_none_to_raise}No corpses answer your call."));
-                if (DEBUG_RAISE_DIAGNOSTICS) TorCoreApi.DumpGraveyardRaiseDiagnostics(s);
                 return;
             }
 
-            ShowRaisedDeadSelection(s, raised);
+            ShowRaisedDeadSelection_FromDelta(s, delta);
         }
 
-        private void ShowRaisedDeadSelection(Settlement where, TroopRoster raised)
+        private void ShowRaisedDeadSelection_FromDelta(Settlement where, TroopRoster delta)
         {
-            var list = raised.GetTroopRoster();
+            var list = delta.GetTroopRoster();
             var elems = new List<InquiryElement>();
             for (int i = 0; i < list.Count; i++)
             {
@@ -139,7 +186,7 @@ namespace TorNecroQoL
 
             var data = new MultiSelectionInquiryData(
                 new TextObject("{=tor_pick_raised}Choose which risen to take").ToString(),
-                new TextObject("{=tor_pick_raised_desc}Selected stacks join your party. Unselected stacks are sacrificed for Dark Energy.").ToString(),
+                new TextObject("{=tor_pick_raised_desc}Selected stacks stay in your party. Unselected stacks are sacrificed for Dark Energy.").ToString(),
                 elems,
                 true, 0, maxSel,
                 GameTexts.FindText("str_done").ToString(),
@@ -147,55 +194,47 @@ namespace TorNecroQoL
                 // OK
                 (selected) =>
                 {
-                    var kept = TroopRoster.CreateDummyTroopRoster();
-                    var discarded = TroopRoster.CreateDummyTroopRoster();
+                    var toKeepIdx = new HashSet<int>();
+                    for (int si = 0; si < selected.Count; si++) toKeepIdx.Add((int)selected[si].Identifier);
 
-                    var selIdx = new HashSet<int>();
-                    for (int si = 0; si < selected.Count; si++)
-                        selIdx.Add((int)selected[si].Identifier);
-
+                    var discard = TroopRoster.CreateDummyTroopRoster();
                     for (int i = 0; i < list.Count; i++)
                     {
                         var e = list[i];
                         if (e.Character == null || e.Number <= 0) continue;
-                        if (selIdx.Contains(i)) kept.AddToCounts(e.Character, e.Number);
-                        else discarded.AddToCounts(e.Character, e.Number);
+                        if (!toKeepIdx.Contains(i)) discard.AddToCounts(e.Character, e.Number);
                     }
 
                     var party = MobileParty.MainParty;
-                    int limit = GetPartySizeLimitCompat(party);
-                    int free = limit - party.MemberRoster.TotalManCount;
-                    if (free < 0) free = 0;
-                    if (free < kept.TotalManCount)
+                    var dl = discard.GetTroopRoster();
+                    for (int i = 0; i < dl.Count; i++)
                     {
-                        TrimRosterToCapacity(kept, free);
-                        MBInformationManager.AddQuickInformation(new TextObject("{=tor_trim_cap}Some risen could not be taken due to party size limit."));
-                    }
-
-                    var keptList = kept.GetTroopRoster();
-                    for (int i = 0; i < keptList.Count; i++)
-                    {
-                        var e = keptList[i];
+                        var e = dl[i];
                         if (e.Character != null && e.Number > 0)
-                            party.MemberRoster.AddToCounts(e.Character, e.Number);
+                            party.MemberRoster.AddToCounts(e.Character, -e.Number);
                     }
 
-                    TorCoreApi.TrySacrificeForDarkEnergy(where, discarded, "graveyard_not_taken");
-                    MBInformationManager.AddQuickInformation(new TextObject("+" + kept.TotalManCount + " risen joined; " + discarded.TotalManCount + " sacrificed."));
-                    TorCoreApi.TryApplyGraveyardSideEffectsAfterRaise(where, MobileParty.MainParty);
+                    TorCoreApi.TrySacrificeForDarkEnergy(where, discard, "graveyard_not_taken");
+                    int kept = delta.TotalManCount - discard.TotalManCount;
+                    MBInformationManager.AddQuickInformation(new TextObject("+" + kept + " risen kept; " + discard.TotalManCount + " sacrificed."));
                 },
                 // Cancel => sacrifice all
                 (_negSelected) =>
                 {
-                    var discarded = TroopRoster.CreateDummyTroopRoster();
-                    for (int i = 0; i < list.Count; i++)
+                    var party = MobileParty.MainParty;
+                    var dl = list;
+                    var sacrificed = 0;
+                    for (int i = 0; i < dl.Count; i++)
                     {
-                        var e = list[i];
+                        var e = dl[i];
                         if (e.Character != null && e.Number > 0)
-                            discarded.AddToCounts(e.Character, e.Number);
+                        {
+                            party.MemberRoster.AddToCounts(e.Character, -e.Number);
+                            sacrificed += e.Number;
+                        }
                     }
-                    TorCoreApi.TrySacrificeForDarkEnergy(Settlement.CurrentSettlement, discarded, "graveyard_cancelled");
-                    TorCoreApi.TryApplyGraveyardSideEffectsAfterRaise(where, MobileParty.MainParty);
+                    TorCoreApi.TrySacrificeForDarkEnergy(where, delta, "graveyard_cancelled");
+                    MBInformationManager.AddQuickInformation(new TextObject("0 kept; " + sacrificed + " sacrificed."));
                 },
                 "", false);
 
