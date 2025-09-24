@@ -29,6 +29,7 @@ namespace TorNecroQoL
             CampaignEvents.OnSessionLaunchedEvent.AddNonSerializedListener(this, OnSessionLaunched);
             CampaignEvents.TickEvent.AddNonSerializedListener(this, OnTick);
             CampaignEvents.MapEventEnded.AddNonSerializedListener(this, OnMapEventEnded);
+            // (no change to other hooks)
         }
 
         public override void SyncData(IDataStore dataStore) { _graveyardPatched = false; }
@@ -47,6 +48,7 @@ namespace TorNecroQoL
                 float perKill;
                 float gain;
                 string why;
+                float bonus = 0f; int heroKills = 0;
                 bool torOk = TryCalcBattleGainCompat(mapEvent, out kills, out perKill, out gain, out why);
 
                 bool applied = false;
@@ -55,6 +57,23 @@ namespace TorNecroQoL
                 {
                     applied = TorResourceBridge.TryAddDarkEnergy(Hero.MainHero, gain, out addReason);
                 }
+
+                // --- NEW: +5 DE per kill by the player (Hero.MainHero) ---
+                try
+                {
+                    heroKills = CountPlayerKillsCompat(mapEvent);
+                    if (heroKills > 0)
+                    {
+                        bonus = heroKills * 5f;
+                        string addReason2;
+                        TorResourceBridge.TryAddDarkEnergy(Hero.MainHero, bonus, out addReason2);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Info("[PlayerKillBonus EX] " + ex);
+                }
+                // ----------------------------------------------------------
 
                 string perKillStr = perKill.ToString("0.###", CultureInfo.InvariantCulture);
                 string gainStr = gain.ToString("0.###", CultureInfo.InvariantCulture);
@@ -66,12 +85,24 @@ namespace TorNecroQoL
                     gainStr,
                     applied ? "True" : "False",
                     torOk ? string.Empty : " (fallback)",
-                    string.IsNullOrEmpty(why) ? string.Empty : " reason=" + why);
+                    string.IsNullOrEmpty(why) ? string.Empty : " reason=" + why)
+                    + (bonus > 0f ? $" | +{bonus.ToString("0.###", CultureInfo.InvariantCulture)} from your {heroKills} kills" : string.Empty);
 
                 if (!applied && !string.IsNullOrEmpty(addReason))
                     msg += " add=" + addReason;
 
                 Logger.Info(msg);
+
+                // --- NEW: surface notes in-game (toasts) ---
+                if (gain > 0f)
+                    MBInformationManager.AddQuickInformation(
+                        new TextObject("+ Dark Energy (battle): " + gainStr));
+                if (bonus > 0f)
+                    MBInformationManager.AddQuickInformation(
+                        new TextObject("+ Dark Energy (your kills): "
+                                       + bonus.ToString("0.###", CultureInfo.InvariantCulture)
+                                       + "  [" + heroKills + " kills × 5]"));
+                // -------------------------------------------
             }
             catch (Exception ex)
             {
@@ -503,6 +534,107 @@ namespace TorNecroQoL
         {
             float perKill;
             return TryCalcBattleGainCompat(mapEvent, out kills, out perKill, out gain, out why);
+        }
+
+        // Count kills done specifically by the player (Hero.MainHero) using reflection-only heuristics.
+        // No reliance on TOR identifiers; works over any enumerable combat log items that expose a Hero killer (+ optional count).
+        private static int CountPlayerKillsCompat(MapEvent me)
+        {
+            try
+            {
+                if (me == null || Hero.MainHero == null) return 0;
+                var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                int total = 0;
+
+                // Scan all public/non-public properties/fields that are IEnumerable-like combat logs
+                System.Collections.Generic.IEnumerable<object> Enumerate(object maybeEnum)
+                {
+                    if (maybeEnum is System.Collections.IEnumerable en)
+                        foreach (var x in en) if (x != null) yield return x;
+                }
+
+                int ExtractCountFromItem(object item)
+                {
+                    // If grouped entries exist, try common numeric names without guessing exact ones:
+                    // prefer: Count/Number/Amount/Value/ResultNumber; else default 1 per entry.
+                    if (item == null) return 1;
+                    var t = item.GetType();
+                    string[] names = { "Count", "Number", "Amount", "Value", "ResultNumber" };
+                    foreach (var n in names)
+                    {
+                        var p = t.GetProperty(n, flags);
+                        if (p != null && SafeToInt(p.GetValue(item, null), out var iv)) return Math.Max(1, iv);
+                        var f = t.GetField(n, flags);
+                        if (f != null && SafeToInt(f.GetValue(item), out iv)) return Math.Max(1, iv);
+                    }
+                    return 1;
+                }
+
+                bool ItemKilledByPlayer(object item)
+                {
+                    var t = item.GetType();
+                    // Any property/field of type Hero equal to Hero.MainHero counts it as a kill by player.
+                    foreach (var p in t.GetProperties(flags))
+                    {
+                        var pt = p.PropertyType;
+                        if (typeof(Hero).IsAssignableFrom(pt))
+                        {
+                            var h = p.GetValue(item, null) as Hero;
+                            if (h == Hero.MainHero) return true;
+                        }
+                    }
+                    foreach (var f in t.GetFields(flags))
+                    {
+                        var ft = f.FieldType;
+                        if (typeof(Hero).IsAssignableFrom(ft))
+                        {
+                            var h = f.GetValue(item) as Hero;
+                            if (h == Hero.MainHero) return true;
+                        }
+                    }
+                    return false;
+                }
+
+                var tme = me.GetType();
+                // Probe obvious collections first; if not found, fall back to scanning everything enumerable.
+                string[] maybeLogs = { "CombatResults", "Casualties", "CasualtyLog", "BattleLog", "IndividualResults", "Events" };
+                var sources = new List<object>();
+                foreach (var name in maybeLogs)
+                {
+                    var p = tme.GetProperty(name, flags); if (p != null) sources.Add(p.GetValue(me, null));
+                    var f = tme.GetField(name, flags);    if (f != null) sources.Add(f.GetValue(me));
+                }
+                if (sources.Count == 0)
+                {
+                    // Fallback: scan *all* enumerable properties/fields on MapEvent
+                    foreach (var p in tme.GetProperties(flags))
+                    {
+                        object val = null;
+                        try { val = p.GetValue(me, null); }
+                        catch { }
+                        if (val is System.Collections.IEnumerable)
+                            sources.Add(val);
+                    }
+                    foreach (var f in tme.GetFields(flags))
+                    {
+                        object val = null;
+                        try { val = f.GetValue(me); }
+                        catch { }
+                        if (val is System.Collections.IEnumerable)
+                            sources.Add(val);
+                    }
+                }
+
+                foreach (var src in sources)
+                    foreach (var entry in Enumerate(src))
+                        if (ItemKilledByPlayer(entry))
+                            total += ExtractCountFromItem(entry);
+                return total;
+            }
+            catch
+            {
+                return 0;
+            }
         }
 
         private static IDictionary<string, GameMenu> GetMenusDictionary(object gmm)
