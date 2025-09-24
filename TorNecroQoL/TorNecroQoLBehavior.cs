@@ -19,77 +19,80 @@ namespace TorNecroQoL
     {
         // enable to print exact gates that block graveyard raising
         private const bool DEBUG_RAISE_DIAGNOSTICS = true;
+        private bool _graveyardPatched;
 
         public override void RegisterEvents()
         {
             CampaignEvents.OnSessionLaunchedEvent.AddNonSerializedListener(this, OnSessionLaunched);
+            CampaignEvents.TickEvent.AddNonSerializedListener(this, OnTick);
         }
 
-        public override void SyncData(IDataStore dataStore) { }
+        public override void SyncData(IDataStore dataStore) { _graveyardPatched = false; }
 
         private void OnSessionLaunched(CampaignGameStarter starter)
         {
             // Do NOT add any new "Go to the graveyard" entry.
             // Only patch the existing TOR graveyard "raise" option consequence.
-            TryPatchExistingGraveyardRaiseOption();
+            _graveyardPatched = TryPatchExistingGraveyardRaiseOption();
+        }
+
+        private void OnTick(float dt)
+        {
+            if (_graveyardPatched) return;
+            _graveyardPatched = TryPatchExistingGraveyardRaiseOption();
         }
 
         // --- Replace TOR's existing graveyard "raise" option consequence with our selection flow ---
-        private void TryPatchExistingGraveyardRaiseOption()
+        private bool TryPatchExistingGraveyardRaiseOption()
         {
             try
             {
                 var gmm = Campaign.Current != null ? Campaign.Current.GameMenuManager : null;
-                if (gmm == null) return;
+                if (gmm == null) return false;
 
                 var dict = GetMenusDictionary(gmm);
-                if (dict == null) return;
+                if (dict == null) return false;
 
                 foreach (var kv in dict)
                 {
                     var menu = kv.Value;
                     if (menu == null) continue;
 
-                    var id = menu.StringId ?? "";
-
                     var options = GetMenuOptions(menu);
                     if (options == null) continue;
-
-                    bool looksLikeGraveyard =
-                        id.IndexOf("grave", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        options.Any(o =>
-                        {
-                            var t = GetOptionText(o);
-                            return t.IndexOf("grave", StringComparison.OrdinalIgnoreCase) >= 0;
-                        });
-
-                    if (!looksLikeGraveyard) continue;
 
                     for (int i = 0; i < options.Count; i++)
                     {
                         var opt = options[i];
                         if (opt == null) continue;
 
-                        var label = GetOptionText(opt);
-                        var optId = GetOptionId(opt);
+                        var del = GetOptionConsequence(opt);
+                        if (del == null || del.Method == null) continue;
+                        if (del.Method.DeclaringType == GetType()) continue;
 
-                        bool isRaise =
-                            (label.IndexOf("raise", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                             (label.IndexOf("corpse", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                              label.IndexOf("dead", StringComparison.OrdinalIgnoreCase) >= 0))
-                            ||
-                            (optId.IndexOf("raise", StringComparison.OrdinalIgnoreCase) >= 0);
+                        var owner = del.Method.DeclaringType != null ? del.Method.DeclaringType.FullName : "";
+                        var mname = del.Method.Name ?? "";
 
-                        if (!isRaise) continue;
+                        bool isTorRaise =
+                            owner.IndexOf("TOR_Core", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                            (owner.IndexOf("RaiseDead", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             mname.IndexOf("Raise", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             mname.IndexOf("Graveyard", StringComparison.OrdinalIgnoreCase) >= 0);
 
-                        var consType = opt.GetType().GetField("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.FieldType
-                                       ?? opt.GetType().GetProperty("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.PropertyType;
+                        if (!isTorRaise) continue;
+
+                        var consType =
+                            opt.GetType().GetField("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.FieldType
+                            ?? opt.GetType().GetProperty("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.PropertyType;
                         var myMi = GetType().GetMethod(nameof(InjectedGraveyardRaiseConsequence), BindingFlags.Instance | BindingFlags.NonPublic);
-                        if (consType != null && myMi != null)
+                        if (consType == null || myMi == null) continue;
+
+                        var replacement = Delegate.CreateDelegate(consType, this, myMi);
+                        if (SetOptionConsequence(opt, replacement))
                         {
-                            var del = Delegate.CreateDelegate(consType, this, myMi);
-                            SetOptionConsequence(opt, del);
-                            return;
+                            if (DEBUG_RAISE_DIAGNOSTICS)
+                                MBInformationManager.AddQuickInformation(new TextObject("Graveyard raise option hooked."));
+                            return true; // patched
                         }
                     }
                 }
@@ -98,11 +101,13 @@ namespace TorNecroQoL
             {
                 InformationManager.DisplayMessage(new InformationMessage("[TorNecroQoL] Graveyard patch failed: " + ex.Message));
             }
+            return false;
         }
 
         // Called when player presses the existing TOR "raise" option
         private void InjectedGraveyardRaiseConsequence(MenuCallbackArgs _)
         {
+            _graveyardPatched = true;
             var s = Settlement.CurrentSettlement;
             if (s == null) return;
 
@@ -176,6 +181,7 @@ namespace TorNecroQoL
 
                     TorCoreApi.TrySacrificeForDarkEnergy(where, discarded, "graveyard_not_taken");
                     MBInformationManager.AddQuickInformation(new TextObject("+" + kept.TotalManCount + " risen joined; " + discarded.TotalManCount + " sacrificed."));
+                    TorCoreApi.TryApplyGraveyardSideEffectsAfterRaise(where, MobileParty.MainParty);
                 },
                 // Cancel => sacrifice all
                 (_negSelected) =>
@@ -188,6 +194,7 @@ namespace TorNecroQoL
                             discarded.AddToCounts(e.Character, e.Number);
                     }
                     TorCoreApi.TrySacrificeForDarkEnergy(Settlement.CurrentSettlement, discarded, "graveyard_cancelled");
+                    TorCoreApi.TryApplyGraveyardSideEffectsAfterRaise(where, MobileParty.MainParty);
                 },
                 "", false);
 
@@ -319,12 +326,25 @@ namespace TorNecroQoL
             return v != null ? v.ToString() : "";
         }
 
-        private static void SetOptionConsequence(GameMenuOption opt, Delegate del)
+        private static bool SetOptionConsequence(GameMenuOption opt, Delegate del)
         {
             var pf = opt.GetType().GetField("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (pf != null) { pf.SetValue(opt, del); return; }
+            if (pf != null) { pf.SetValue(opt, del); return true; }
             var pp = opt.GetType().GetProperty("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (pp != null) pp.SetValue(opt, del, null);
+            if (pp != null)
+            {
+                pp.SetValue(opt, del, null);
+                return true;
+            }
+            return false;
+        }
+
+        private static Delegate GetOptionConsequence(GameMenuOption opt)
+        {
+            var f = opt.GetType().GetField("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (f != null) return f.GetValue(opt) as Delegate;
+            var p = opt.GetType().GetProperty("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            return p != null ? p.GetValue(opt, null) as Delegate : null;
         }
     }
 
@@ -490,6 +510,49 @@ namespace TorNecroQoL
             }
 
             MBInformationManager.AddQuickInformation(new TextObject("+ Dark Energy [" + context + "]: " + gain.Value));
+        }
+
+        public static void TryApplyGraveyardSideEffectsAfterRaise(Settlement s, MobileParty party)
+        {
+            var tor = GetTorAsm();
+            if (tor == null || s == null) return;
+
+            var rd = tor.GetType("TOR_Core.CampaignMechanics.RaiseDead");
+            if (rd == null) return;
+
+            var ms = rd.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+            string[] prefer = { "ApplyGraveyardRaise", "CommitGraveyardRaise", "ConsumeGraveyard", "UseGraveyard", "StartGraveyardCooldown" };
+
+            object[] pool = { s, party, Hero.MainHero, MobileParty.MainParty, PartyBase.MainParty, Campaign.Current };
+
+            for (int n = 0; n < prefer.Length; n++)
+            {
+                for (int i = 0; i < ms.Length; i++)
+                {
+                    var m = ms[i];
+                    if (m.Name.IndexOf(prefer[n], StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+                    var ps = m.GetParameters();
+                    var args = new object[ps.Length];
+                    bool ok = true;
+                    for (int j = 0; j < ps.Length; j++)
+                    {
+                        var want = ps[j].ParameterType;
+                        object got = null;
+                        for (int k = 0; k < pool.Length; k++)
+                        {
+                            var cand = pool[k];
+                            if (cand != null && want.IsInstanceOfType(cand)) { got = cand; break; }
+                        }
+                        if (got == null) { ok = false; break; }
+                        args[j] = got;
+                    }
+                    if (!ok) continue;
+
+                    try { m.Invoke(null, args); return; }
+                    catch { }
+                }
+            }
         }
 
         // --- Diagnostics: tell you EXACTLY why graveyard raise fails (vamp gate, pool, cooldown, siege, etc.) ---
