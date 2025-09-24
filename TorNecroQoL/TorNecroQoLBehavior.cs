@@ -1,4 +1,4 @@
-﻿// TorNecroQoLBehavior.cs  (C# 7.3)
+// TorNecroQoLBehavior.cs  (C# 7.3)
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -17,6 +17,9 @@ namespace TorNecroQoL
 {
     public sealed class TorNecroQoLBehavior : CampaignBehaviorBase
     {
+        // enable to print exact gates that block graveyard raising
+        private const bool DEBUG_RAISE_DIAGNOSTICS = true;
+
         public override void RegisterEvents()
         {
             CampaignEvents.OnSessionLaunchedEvent.AddNonSerializedListener(this, OnSessionLaunched);
@@ -26,39 +29,87 @@ namespace TorNecroQoL
 
         private void OnSessionLaunched(CampaignGameStarter starter)
         {
-            // Town → Graveyard
-            starter.AddGameMenuOption("town", "tor_go_graveyard",
-                "{=tor_go_grave}Go to the graveyard",
-                Graveyard_Condition, _ => GameMenu.SwitchToMenu("tor_graveyard"), false, 2);
-
-            // Graveyard menu
-            starter.AddGameMenu("tor_graveyard",
-                "{=tor_grave_desc}Weathered stones. Fresh soil. Whispers of the tethered.", null);
-
-            starter.AddGameMenuOption("tor_graveyard", "tor_grave_raise",
-                "{=tor_grave_raise}Raise dead from the corpses in the ground",
-                _ => true, GraveyardRaise_Consequence, false, 1);
-
-            starter.AddGameMenuOption("tor_graveyard", "tor_grave_leave",
-                "{=str_leave}Leave", null, _ => GameMenu.SwitchToMenu("town"), true, 3);
+            // Do NOT add any new "Go to the graveyard" entry.
+            // Only patch the existing TOR graveyard "raise" option consequence.
+            TryPatchExistingGraveyardRaiseOption();
         }
 
-        private bool Graveyard_Condition(MenuCallbackArgs args)
+        // --- Replace TOR's existing graveyard "raise" option consequence with our selection flow ---
+        private void TryPatchExistingGraveyardRaiseOption()
         {
-            args.optionLeaveType = GameMenuOption.LeaveType.Submenu;
-            var s = Settlement.CurrentSettlement;
-            return s != null && s.IsTown && PlayerQualifiesForNecromancy();
+            try
+            {
+                var gmm = Campaign.Current != null ? Campaign.Current.GameMenuManager : null;
+                if (gmm == null) return;
+
+                // GameMenuManager usually holds a Dictionary<string, GameMenu> named "_gameMenus" or "GameMenus"
+                var dict = GetMenusDictionary(gmm);
+                if (dict == null) return;
+
+                foreach (var kv in dict)
+                {
+                    var menu = kv.Value;
+                    if (menu == null) continue;
+
+                    // quick filter by id/name text
+                    var id = menu.StringId ?? "";
+                    var text = menu.Text != null ? menu.Text.ToString() : "";
+                    bool looksLikeGraveyard = id.IndexOf("grave", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                              text.IndexOf("grave", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (!looksLikeGraveyard) continue;
+
+                    // get options list
+                    var options = GetMenuOptions(menu);
+                    if (options == null) continue;
+
+                    for (int i = 0; i < options.Count; i++)
+                    {
+                        var opt = options[i];
+                        if (opt == null) continue;
+                        var label = GetOptionText(opt);
+                        var optId = GetOptionId(opt);
+
+                        // Heuristic: option that contains "raise" and "corpse" or has an id with "raise"
+                        bool isRaise =
+                            (label.IndexOf("raise", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                             (label.IndexOf("corpse", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                              label.IndexOf("dead", StringComparison.OrdinalIgnoreCase) >= 0))
+                            ||
+                            (optId.IndexOf("raise", StringComparison.OrdinalIgnoreCase) >= 0);
+
+                        if (!isRaise) continue;
+
+                        // Swap consequence delegate
+                        var consType = opt.GetType().GetField("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.FieldType
+                                       ?? opt.GetType().GetProperty("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.PropertyType;
+                        var myMi = GetType().GetMethod(nameof(InjectedGraveyardRaiseConsequence), BindingFlags.Instance | BindingFlags.NonPublic);
+                        if (consType != null && myMi != null)
+                        {
+                            var del = Delegate.CreateDelegate(consType, this, myMi);
+                            SetOptionConsequence(opt, del);
+                            // Done: first matching option replaced
+                            return;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                InformationManager.DisplayMessage(new InformationMessage("[TorNecroQoL] Graveyard patch failed: " + ex.Message));
+            }
         }
 
-        private void GraveyardRaise_Consequence(MenuCallbackArgs _)
+        // Called when player presses the existing TOR "raise" option
+        private void InjectedGraveyardRaiseConsequence(MenuCallbackArgs _)
         {
             var s = Settlement.CurrentSettlement;
             if (s == null) return;
 
-            var raised = TorCoreApi.TryCalculateRaiseDeadTroops(s, MobileParty.MainParty);
+            var raised = TorCoreApi.TryCalculateRaiseDeadTroopsFromGraveyard(s, MobileParty.MainParty);
             if (raised == null || raised.TotalManCount == 0)
             {
                 MBInformationManager.AddQuickInformation(new TextObject("{=tor_none_to_raise}No corpses answer your call."));
+                if (DEBUG_RAISE_DIAGNOSTICS) TorCoreApi.DumpGraveyardRaiseDiagnostics(s);
                 return;
             }
 
@@ -74,7 +125,7 @@ namespace TorNecroQoL
                 var e = list[i];
                 if (e.Character == null || e.Number <= 0) continue;
                 string label = e.Character.Name != null ? e.Character.Name.ToString() : e.Character.StringId;
-                elems.Add(new InquiryElement(i, $"{label} x{e.Number}", null, true, e.Character.StringId));
+                elems.Add(new InquiryElement(i, label + " x" + e.Number, null, true, e.Character.StringId));
             }
 
             int maxSel = elems.Count;
@@ -83,12 +134,10 @@ namespace TorNecroQoL
                 new TextObject("{=tor_pick_raised}Choose which risen to take").ToString(),
                 new TextObject("{=tor_pick_raised_desc}Selected stacks join your party. Unselected stacks are sacrificed for Dark Energy.").ToString(),
                 elems,
-                true,                    // isExitShown
-                0,                       // minSelectable
-                maxSel,                  // maxSelectable
+                true, 0, maxSel,
                 GameTexts.FindText("str_done").ToString(),
                 GameTexts.FindText("str_cancel").ToString(),
-                // Affirmative
+                // OK
                 (selected) =>
                 {
                     var kept = TroopRoster.CreateDummyTroopRoster();
@@ -113,8 +162,7 @@ namespace TorNecroQoL
                     if (free < kept.TotalManCount)
                     {
                         TrimRosterToCapacity(kept, free);
-                        MBInformationManager.AddQuickInformation(
-                            new TextObject("{=tor_trim_cap}Some risen could not be taken due to party size limit."));
+                        MBInformationManager.AddQuickInformation(new TextObject("{=tor_trim_cap}Some risen could not be taken due to party size limit."));
                     }
 
                     var keptList = kept.GetTroopRoster();
@@ -126,12 +174,9 @@ namespace TorNecroQoL
                     }
 
                     TorCoreApi.TrySacrificeForDarkEnergy(where, discarded, "graveyard_not_taken");
-
-                    MBInformationManager.AddQuickInformation(
-                        new TextObject($"+{kept.TotalManCount} risen joined; {discarded.TotalManCount} sacrificed."));
-                    GameMenu.SwitchToMenu("tor_graveyard");
+                    MBInformationManager.AddQuickInformation(new TextObject("+" + kept.TotalManCount + " risen joined; " + discarded.TotalManCount + " sacrificed."));
                 },
-                // Negative → alles opfern
+                // Cancel => sacrifice all
                 (_negSelected) =>
                 {
                     var discarded = TroopRoster.CreateDummyTroopRoster();
@@ -142,10 +187,8 @@ namespace TorNecroQoL
                             discarded.AddToCounts(e.Character, e.Number);
                     }
                     TorCoreApi.TrySacrificeForDarkEnergy(Settlement.CurrentSettlement, discarded, "graveyard_cancelled");
-                    GameMenu.SwitchToMenu("tor_graveyard");
                 },
-                "",  // soundEventPath
-                false);
+                "", false);
 
             ShowMultiSelectionInquiryCompat(data);
         }
@@ -155,19 +198,20 @@ namespace TorNecroQoL
             var im = typeof(InformationManager);
             var mi = im.GetMethod("ShowMultiSelectionInquiry",
                                   BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
-                                  null,
-                                  new Type[] { typeof(MultiSelectionInquiryData), typeof(bool) },
-                                  null);
-            if (mi != null) { mi.Invoke(null, new object[] { data, true }); return; }
-
-            mi = im.GetMethod("ShowMultiSelectionInquiry",
-                              BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
-                              null,
-                              new Type[] { typeof(MultiSelectionInquiryData) },
-                              null);
-            if (mi != null) { mi.Invoke(null, new object[] { data }); return; }
-
-            MBInformationManager.AddQuickInformation(new TextObject("{=tor_ui_missing}Multi-selection UI not available in this build."));
+                                  null, new Type[] { typeof(MultiSelectionInquiryData), typeof(bool) }, null)
+                  ?? im.GetMethod("ShowMultiSelectionInquiry",
+                                  BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                                  null, new Type[] { typeof(MultiSelectionInquiryData) }, null);
+            if (mi != null)
+            {
+                var pars = mi.GetParameters();
+                if (pars.Length == 2) mi.Invoke(null, new object[] { data, true });
+                else mi.Invoke(null, new object[] { data });
+            }
+            else
+            {
+                MBInformationManager.AddQuickInformation(new TextObject("{=tor_ui_missing}Multi-selection UI not available in this build."));
+            }
         }
 
         private static void TrimRosterToCapacity(TroopRoster roster, int capacity)
@@ -181,17 +225,13 @@ namespace TorNecroQoL
             }
         }
 
-        private bool PlayerQualifiesForNecromancy()
-        {
-            return true;
-        }
+        private bool PlayerQualifiesForNecromancy() { return true; }
 
-        // -------- Helper hier als KLASSENMETHODEN, nicht top-level / nicht lokal --------
+        // ---- helpers for party limit and menu patching ----
         private static int GetPartySizeLimitCompat(MobileParty party)
         {
             if (party == null) return int.MaxValue;
 
-            // MobileParty.PartySizeLimit
             var mpProp = typeof(MobileParty).GetProperty("PartySizeLimit", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (mpProp != null)
             {
@@ -201,7 +241,6 @@ namespace TorNecroQoL
                 if (val is int iv) return iv;
             }
 
-            // PartyBase.MainParty.PartySizeLimit
             var pb = PartyBase.MainParty;
             if (pb != null)
             {
@@ -214,7 +253,6 @@ namespace TorNecroQoL
                     if (val2 is int iv2) return iv2;
                 }
             }
-
             return int.MaxValue;
         }
 
@@ -223,7 +261,6 @@ namespace TorNecroQoL
             result = 0;
             if (val == null) return false;
             var t = val.GetType();
-
             var pRes = t.GetProperty("ResultNumber", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (pRes != null)
             {
@@ -231,7 +268,6 @@ namespace TorNecroQoL
                 if (v is float f) { result = (int)Math.Floor(f); return true; }
                 if (v is int i) { result = i; return true; }
             }
-
             var pVal = t.GetProperty("Value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (pVal != null)
             {
@@ -239,8 +275,55 @@ namespace TorNecroQoL
                 if (v2 is float f2) { result = (int)Math.Floor(f2); return true; }
                 if (v2 is int i2) { result = i2; return true; }
             }
-
             return false;
+        }
+
+        private static IDictionary<string, GameMenu> GetMenusDictionary(object gmm)
+        {
+            var t = gmm.GetType();
+            // common private fields
+            var f = t.GetField("_gameMenus", BindingFlags.Instance | BindingFlags.NonPublic)
+                 ?? t.GetField("gameMenus", BindingFlags.Instance | BindingFlags.NonPublic)
+                 ?? t.GetField("GameMenus",  BindingFlags.Instance | BindingFlags.NonPublic);
+            return f != null ? f.GetValue(gmm) as IDictionary<string, GameMenu> : null;
+        }
+
+        private static IList<GameMenuOption> GetMenuOptions(GameMenu menu)
+        {
+            var t = typeof(GameMenu);
+            // Options list often private
+            var p = t.GetProperty("MenuOptions", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (p != null) return p.GetValue(menu, null) as IList<GameMenuOption>;
+            var f = t.GetField("_menuOptions", BindingFlags.Instance | BindingFlags.NonPublic)
+                 ?? t.GetField("MenuOptions", BindingFlags.Instance | BindingFlags.NonPublic);
+            return f != null ? f.GetValue(menu) as IList<GameMenuOption> : null;
+        }
+
+        private static string GetOptionText(GameMenuOption opt)
+        {
+            var p = opt.GetType().GetProperty("Text", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (p != null)
+            {
+                var to = p.GetValue(opt, null) as TextObject;
+                if (to != null) return to.ToString();
+            }
+            return "";
+        }
+
+        private static string GetOptionId(GameMenuOption opt)
+        {
+            var p = opt.GetType().GetProperty("OptionId", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                 ?? opt.GetType().GetProperty("Id", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            var v = p != null ? p.GetValue(opt, null) : null;
+            return v != null ? v.ToString() : "";
+        }
+
+        private static void SetOptionConsequence(GameMenuOption opt, Delegate del)
+        {
+            var pf = opt.GetType().GetField("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (pf != null) { pf.SetValue(opt, del); return; }
+            var pp = opt.GetType().GetProperty("OnConsequence", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (pp != null) pp.SetValue(opt, del, null);
         }
     }
 
@@ -261,8 +344,8 @@ namespace TorNecroQoL
             return _torAsm;
         }
 
-        // --------- Raise Dead (graveyard) ----------
-        public static TroopRoster TryCalculateRaiseDeadTroops(Settlement s, MobileParty party)
+        // --- Graveyard raise with correct source binding ---
+        public static TroopRoster TryCalculateRaiseDeadTroopsFromGraveyard(Settlement s, MobileParty party)
         {
             var tor = GetTorAsm();
             if (tor == null) return null;
@@ -272,41 +355,99 @@ namespace TorNecroQoL
 
             if (_raiseDeadStatic == null) return null;
 
-            var methods = _raiseDeadStatic.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-            var list = new List<MethodInfo>();
-            for (int i = 0; i < methods.Length; i++)
-                if (methods[i].Name == "CalculateRaiseDeadTroops") list.Add(methods[i]);
-            if (list.Count == 0) return null;
-
-            object[] pool = { s, party, Hero.MainHero, MobileParty.MainParty, PartyBase.MainParty, Settlement.CurrentSettlement, Campaign.Current };
-
-            for (int k = 0; k < list.Count; k++)
+            // Prefer a method that clearly targets graveyards
+            var ms = _raiseDeadStatic.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+            MethodInfo direct = null;
+            for (int i = 0; i < ms.Length; i++)
             {
-                var m = list[k];
+                var m = ms[i];
+                if (m.Name.IndexOf("Graveyard", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                    m.Name.IndexOf("Calculate", StringComparison.OrdinalIgnoreCase) >= 0)
+                { direct = m; break; }
+            }
+            if (direct != null)
+            {
+                var args = BindArgs(direct.GetParameters(), s, party);
+                if (args != null)
+                {
+                    var ret = direct.Invoke(null, args);
+                    if (ret is TroopRoster tr0) return tr0;
+                }
+            }
+
+            // Fallback: CalculateRaiseDeadTroops with a "Source=Graveyard" enum or flag if present
+            var cands = ms.Where(m => m.Name == "CalculateRaiseDeadTroops").ToArray();
+            for (int i = 0; i < cands.Length; i++)
+            {
+                var m = cands[i];
                 var ps = m.GetParameters();
                 var args = new object[ps.Length];
                 bool ok = true;
-                for (int i = 0; i < ps.Length; i++)
-                {
-                    var want = ps[i].ParameterType;
-                    object got = null;
-                    for (int j = 0; j < pool.Length; j++)
-                    {
-                        var cand = pool[j];
-                        if (cand != null && want.IsInstanceOfType(cand)) { got = cand; break; }
-                    }
-                    if (got == null) { ok = false; break; }
-                    args[i] = got;
-                }
-                if (!ok) continue;
 
+                for (int j = 0; j < ps.Length; j++)
+                {
+                    var want = ps[j].ParameterType;
+
+                    // Try enum named like *Raise*Source* set to Graveyard
+                    if (want.IsEnum && want.Name.IndexOf("Source", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        var graveVal = EnumGetByNameContains(want, "Graveyard");
+                        if (graveVal != null) { args[j] = graveVal; continue; }
+                    }
+
+                    // common types
+                    object got =
+                        (want.IsInstanceOfType(s) ? (object)s :
+                        want.IsInstanceOfType(party) ? (object)party :
+                        want.IsInstanceOfType(Hero.MainHero) ? (object)Hero.MainHero :
+                        want.IsInstanceOfType(MobileParty.MainParty) ? (object)MobileParty.MainParty :
+                        want.IsInstanceOfType(PartyBase.MainParty) ? (object)PartyBase.MainParty :
+                        want.IsInstanceOfType(Settlement.CurrentSettlement) ? (object)Settlement.CurrentSettlement :
+                        want.IsInstanceOfType(Campaign.Current) ? (object)Campaign.Current : null);
+
+                    if (got == null) { ok = false; break; }
+                    args[j] = got;
+                }
+
+                if (!ok) continue;
                 var ret = m.Invoke(null, args);
                 if (ret is TroopRoster tr) return tr;
             }
+
             return null;
         }
 
-        // --------- Dark Energy (sacrifice) ----------
+        private static object EnumGetByNameContains(Type enumType, string token)
+        {
+            var names = Enum.GetNames(enumType);
+            for (int i = 0; i < names.Length; i++)
+                if (names[i].IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return Enum.Parse(enumType, names[i]);
+            return null;
+        }
+
+        private static object[] BindArgs(ParameterInfo[] ps, Settlement s, MobileParty party)
+        {
+            var args = new object[ps.Length];
+            for (int i = 0; i < ps.Length; i++)
+            {
+                var want = ps[i].ParameterType;
+                object got =
+                    (want.IsEnum ? null :
+                    want.IsInstanceOfType(s) ? (object)s :
+                    want.IsInstanceOfType(party) ? (object)party :
+                    want.IsInstanceOfType(Hero.MainHero) ? (object)Hero.MainHero :
+                    want.IsInstanceOfType(MobileParty.MainParty) ? (object)MobileParty.MainParty :
+                    want.IsInstanceOfType(PartyBase.MainParty) ? (object)PartyBase.MainParty :
+                    want.IsInstanceOfType(Settlement.CurrentSettlement) ? (object)Settlement.CurrentSettlement :
+                    want.IsInstanceOfType(Campaign.Current) ? (object)Campaign.Current : null);
+                if (got == null) return null;
+                args[i] = got;
+            }
+            return args;
+        }
+
+        // Sacrifice through TOR_Core CustomResourceManager
         public static void TrySacrificeForDarkEnergy(Settlement where, TroopRoster discarded, string context)
         {
             if (discarded == null || discarded.TotalManCount <= 0) return;
@@ -318,7 +459,6 @@ namespace TorNecroQoL
                 _resMgrType = tor.GetType("TOR_Core.CampaignMechanics.CustomResources.CustomResourceManager");
             if (_customResType == null)
                 _customResType = tor.GetType("TOR_Core.CampaignMechanics.CustomResources.CustomResource");
-
             if (_resMgrType == null || _customResType == null) return;
 
             object mgr = GetManagerInstance(_resMgrType);
@@ -330,40 +470,90 @@ namespace TorNecroQoL
             int? gain = TryCalculateBattleStyleGain(mgr, discarded, where);
             if (gain == null || gain.Value <= 0) return;
 
-            var addMeths = _resMgrType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
-            MethodInfo addMeth = null;
-            for (int i = 0; i < addMeths.Length; i++)
-            {
-                var mi = addMeths[i];
-                if (mi.Name != "AddCustomResource") continue;
-                var pars = mi.GetParameters();
-                if ((pars.Length == 2 || pars.Length == 3) && pars[0].ParameterType == _customResType)
-                { addMeth = mi; break; }
-            }
-            if (addMeth == null) return;
+            var add = _resMgrType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+                .FirstOrDefault(mi => mi.Name == "AddCustomResource" &&
+                                      mi.GetParameters().Length >= 2 &&
+                                      mi.GetParameters()[0].ParameterType == _customResType);
+            if (add == null) return;
 
-            var p = addMeth.GetParameters();
-            if (addMeth.IsStatic)
+            var pars = add.GetParameters();
+            if (add.IsStatic)
             {
-                if (p.Length == 2) addMeth.Invoke(null, new object[] { darkRes, gain.Value });
-                else addMeth.Invoke(null, new object[] { darkRes, gain.Value, true });
+                if (pars.Length == 2) add.Invoke(null, new object[] { darkRes, gain.Value });
+                else add.Invoke(null, new object[] { darkRes, gain.Value, true });
             }
             else
             {
-                if (p.Length == 2) addMeth.Invoke(mgr, new object[] { darkRes, gain.Value });
-                else addMeth.Invoke(mgr, new object[] { darkRes, gain.Value, true });
+                if (pars.Length == 2) add.Invoke(mgr, new object[] { darkRes, gain.Value });
+                else add.Invoke(mgr, new object[] { darkRes, gain.Value, true });
             }
 
-            MBInformationManager.AddQuickInformation(new TextObject($"+ Dark Energy [{context}]: {gain.Value}"));
+            MBInformationManager.AddQuickInformation(new TextObject("+ Dark Energy [" + context + "]: " + gain.Value));
         }
 
+        // --- Diagnostics: tell you EXACTLY why graveyard raise fails (vamp gate, pool, cooldown, siege, etc.) ---
+        public static void DumpGraveyardRaiseDiagnostics(Settlement s)
+        {
+            try
+            {
+                var tor = GetTorAsm();
+                if (tor == null || s == null) return;
+
+                // Try common checks exposed by TOR_Core.RaiseDead
+                var rd = tor.GetType("TOR_Core.CampaignMechanics.RaiseDead");
+                if (rd != null)
+                {
+                    TryLogBool(rd, "CanRaiseFromGraveyard", s, "CanRaiseFromGraveyard");
+                    TryLogInt(rd, "GetGraveyardCorpseCount", s, "GraveyardCorpseCount");
+                    TryLogBool(rd, "IsGraveyardOnCooldown", s, "GraveyardCooldown");
+                }
+
+                // Generic vampire gate
+                var vampType = tor.GetType("TOR_Core.CampaignMechanics.Vampire.VampireManager")
+                           ?? tor.GetType("TOR_Core.CampaignMechanics.VampireManager");
+                if (vampType != null)
+                    TryLogBool(vampType, "IsVampire", Hero.MainHero, "IsVampire(Hero)");
+
+                // Siege/state gates
+                TryQuickNotice("Settlement.IsUnderSiege", s.IsUnderSiege);
+                TryQuickNotice("Settlement.IsTown", s.IsTown);
+
+            }
+            catch { /* silent */ }
+        }
+
+        private static void TryLogBool(Type t, string method, object arg, string label)
+        {
+            var mi = t.GetMethod(method, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance);
+            if (mi == null) return;
+            object inst = mi.IsStatic ? null : Activator.CreateInstance(t);
+            var ok = mi.GetParameters().Length == 1 ? mi.Invoke(inst, new object[] { arg }) : null;
+            if (ok is bool b)
+                MBInformationManager.AddQuickInformation(new TextObject("[Diag] " + label + ": " + (b ? "true" : "false")));
+        }
+
+        private static void TryLogInt(Type t, string method, object arg, string label)
+        {
+            var mi = t.GetMethod(method, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance);
+            if (mi == null) return;
+            object inst = mi.IsStatic ? null : Activator.CreateInstance(t);
+            var v = mi.GetParameters().Length == 1 ? mi.Invoke(inst, new object[] { arg }) : null;
+            if (v is int iv)
+                MBInformationManager.AddQuickInformation(new TextObject("[Diag] " + label + ": " + iv));
+        }
+
+        private static void TryQuickNotice(string label, bool value)
+        {
+            MBInformationManager.AddQuickInformation(new TextObject("[Diag] " + label + ": " + (value ? "true" : "false")));
+        }
+
+        // --- internal helpers for custom resources ---
         private static object GetManagerInstance(Type mgrType)
         {
             var inst = mgrType.GetProperty("Instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
             if (inst != null) return inst.GetValue(null, null);
             inst = mgrType.GetProperty("Current", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
             if (inst != null) return inst.GetValue(null, null);
-
             var ctor = mgrType.GetConstructor(Type.EmptyTypes);
             return ctor != null ? Activator.CreateInstance(mgrType) : null;
         }
