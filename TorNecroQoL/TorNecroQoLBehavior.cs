@@ -25,11 +25,6 @@ namespace TorNecroQoL
         {
             CampaignEvents.OnSessionLaunchedEvent.AddNonSerializedListener(this, OnSessionLaunched);
             CampaignEvents.TickEvent.AddNonSerializedListener(this, OnTick);
-            CampaignEvents.GameMenuOpenedEvent.AddNonSerializedListener(this, (menu, args) =>
-            {
-                if (_graveyardPatched) return;
-                _graveyardPatched = TryPatchExistingGraveyardRaiseOption();
-            });
         }
 
         public override void SyncData(IDataStore dataStore) { _graveyardPatched = false; }
