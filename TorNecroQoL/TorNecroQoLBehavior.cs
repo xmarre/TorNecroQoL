@@ -1,5 +1,6 @@
 // TorNecroQoLBehavior.cs  (C# 7.3)
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -18,7 +19,7 @@ namespace TorNecroQoL
     public sealed class TorNecroQoLBehavior : CampaignBehaviorBase
     {
         // enable to print exact gates that block graveyard raising
-        private const bool DEBUG_RAISE_DIAGNOSTICS = true;
+        private const bool DEBUG_RAISE_DIAGNOSTICS = false;
         private bool _graveyardPatched;
 
         public override void RegisterEvents()
@@ -373,34 +374,34 @@ namespace TorNecroQoL
 
             if (_raiseDeadStatic == null)
                 _raiseDeadStatic = tor.GetType("TOR_Core.CampaignMechanics.RaiseDead");
-
             if (_raiseDeadStatic == null) return null;
 
-            // Prefer a method that clearly targets graveyards
             var ms = _raiseDeadStatic.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-            MethodInfo direct = null;
+
+            // 1) Direct graveyard-named calculators
             for (int i = 0; i < ms.Length; i++)
             {
                 var m = ms[i];
-                if (m.Name.IndexOf("Graveyard", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                    m.Name.IndexOf("Calculate", StringComparison.OrdinalIgnoreCase) >= 0)
-                { direct = m; break; }
-            }
-            if (direct != null)
-            {
-                var args = BindArgs(direct.GetParameters(), s, party);
-                if (args != null)
+                var name = m.Name.ToLowerInvariant();
+                if (!(name.Contains("grave") || name.Contains("graveyard"))) continue;
+                if (!(name.Contains("calc") || name.Contains("get") || name.Contains("raise"))) continue;
+
+                var args = BindArgs(m.GetParameters(), s, party);
+                if (args == null) continue;
+                try
                 {
-                    var ret = direct.Invoke(null, args);
-                    if (ret is TroopRoster tr0) return tr0;
+                    var ret = m.Invoke(null, args);
+                    var tr = AsTroopRoster(ret);
+                    if (tr != null && tr.TotalManCount > 0) return tr;
                 }
+                catch { }
             }
 
-            // Fallback: CalculateRaiseDeadTroops with a "Source=Graveyard" enum or flag if present
-            var cands = ms.Where(m => m.Name == "CalculateRaiseDeadTroops").ToArray();
-            for (int i = 0; i < cands.Length; i++)
+            // 2) Generic calculators + enum Source=Graveyard
+            var generic = ms.Where(m => m.Name == "CalculateRaiseDeadTroops").ToArray();
+            for (int i = 0; i < generic.Length; i++)
             {
-                var m = cands[i];
+                var m = generic[i];
                 var ps = m.GetParameters();
                 var args = new object[ps.Length];
                 bool ok = true;
@@ -409,14 +410,15 @@ namespace TorNecroQoL
                 {
                     var want = ps[j].ParameterType;
 
-                    // Try enum named like *Raise*Source* set to Graveyard
+                    // Enum source -> pick Graveyard if present
                     if (want.IsEnum && want.Name.IndexOf("Source", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        var graveVal = EnumGetByNameContains(want, "Graveyard");
-                        if (graveVal != null) { args[j] = graveVal; continue; }
+                        var gv = EnumGetByNameContains(want, "Graveyard");
+                        if (gv == null) gv = EnumGetByNameContains(want, "Grave");
+                        if (gv != null) { args[j] = gv; continue; }
                     }
 
-                    // common types
+                    // Common bindings
                     object got =
                         (want.IsInstanceOfType(s) ? (object)s :
                         want.IsInstanceOfType(party) ? (object)party :
@@ -429,13 +431,41 @@ namespace TorNecroQoL
                     if (got == null) { ok = false; break; }
                     args[j] = got;
                 }
-
                 if (!ok) continue;
-                var ret = m.Invoke(null, args);
-                if (ret is TroopRoster tr) return tr;
+
+                try
+                {
+                    var ret = m.Invoke(null, args);
+                    var tr = AsTroopRoster(ret);
+                    if (tr != null && tr.TotalManCount > 0) return tr;
+                }
+                catch { }
             }
 
             return null;
+        }
+
+        private static TroopRoster AsTroopRoster(object ret)
+        {
+            if (ret == null) return null;
+            if (ret is TroopRoster tr) return tr;
+
+            var en = ret as IEnumerable;
+            if (en == null) return null;
+
+            var roster = TroopRoster.CreateDummyTroopRoster();
+            foreach (var item in en)
+            {
+                var t = item.GetType();
+                var k = t.GetProperty("Key") ?? t.GetProperty("Item1");
+                var v = t.GetProperty("Value") ?? t.GetProperty("Item2");
+                if (k == null || v == null) continue;
+                var ch = k.GetValue(item, null) as CharacterObject;
+                var numObj = v.GetValue(item, null);
+                int n = (numObj is int) ? (int)numObj : (numObj is float) ? (int)Math.Round((float)numObj) : 0;
+                if (ch != null && n > 0) roster.AddToCounts(ch, n);
+            }
+            return roster.TotalManCount > 0 ? roster : null;
         }
 
         private static object EnumGetByNameContains(Type enumType, string token)
@@ -521,10 +551,16 @@ namespace TorNecroQoL
             if (rd == null) return;
 
             var ms = rd.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-            string[] prefer = { "ApplyGraveyardRaise", "CommitGraveyardRaise", "ConsumeGraveyard", "UseGraveyard", "StartGraveyardCooldown" };
+            string[] prefer =
+            {
+                "ApplyGraveyardRaise","CommitGraveyardRaise","ConsumeGraveyard","UseGraveyard",
+                "StartGraveyardCooldown","BeginGraveyardCooldown","SetGraveyardCooldown",
+                "StartCooldown","BeginCooldown","SetCooldown","CooldownGraveyard"
+            };
 
             object[] pool = { s, party, Hero.MainHero, MobileParty.MainParty, PartyBase.MainParty, Campaign.Current };
 
+            // First try side-effect methods without explicit hours
             for (int n = 0; n < prefer.Length; n++)
             {
                 for (int i = 0; i < ms.Length; i++)
@@ -538,6 +574,11 @@ namespace TorNecroQoL
                     for (int j = 0; j < ps.Length; j++)
                     {
                         var want = ps[j].ParameterType;
+
+                        // If a numeric parameter looks like "hours", pass 8
+                        if (want == typeof(int)) { args[j] = 8; continue; }
+                        if (want == typeof(float)) { args[j] = 8f; continue; }
+
                         object got = null;
                         for (int k = 0; k < pool.Length; k++)
                         {
@@ -578,10 +619,6 @@ namespace TorNecroQoL
                 if (vampType != null)
                     TryLogBool(vampType, "IsVampire", Hero.MainHero, "IsVampire(Hero)");
 
-                // Siege/state gates
-                TryQuickNotice("Settlement.IsUnderSiege", s.IsUnderSiege);
-                TryQuickNotice("Settlement.IsTown", s.IsTown);
-
             }
             catch { /* silent */ }
         }
@@ -604,11 +641,6 @@ namespace TorNecroQoL
             var v = mi.GetParameters().Length == 1 ? mi.Invoke(inst, new object[] { arg }) : null;
             if (v is int iv)
                 MBInformationManager.AddQuickInformation(new TextObject("[Diag] " + label + ": " + iv));
-        }
-
-        private static void TryQuickNotice(string label, bool value)
-        {
-            MBInformationManager.AddQuickInformation(new TextObject("[Diag] " + label + ": " + (value ? "true" : "false")));
         }
 
         // --- internal helpers for custom resources ---
