@@ -2,6 +2,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using TaleWorlds.CampaignSystem;
@@ -27,9 +28,56 @@ namespace TorNecroQoL
         {
             CampaignEvents.OnSessionLaunchedEvent.AddNonSerializedListener(this, OnSessionLaunched);
             CampaignEvents.TickEvent.AddNonSerializedListener(this, OnTick);
+            CampaignEvents.MapEventEnded.AddNonSerializedListener(this, OnMapEventEnded);
         }
 
         public override void SyncData(IDataStore dataStore) { _graveyardPatched = false; }
+
+        private void OnMapEventEnded(MapEvent mapEvent)
+        {
+            try
+            {
+                if (mapEvent == null) return;
+                if (Hero.MainHero == null) return;
+
+                bool playerInvolved = mapEvent == MapEvent.PlayerMapEvent || TorResourceBridge.PlayerWasInvolved(mapEvent);
+                if (!playerInvolved) return;
+
+                int kills;
+                float perKill;
+                float gain;
+                string why;
+                bool torOk = TryCalcBattleGainCompat(mapEvent, out kills, out perKill, out gain, out why);
+
+                bool applied = false;
+                string addReason = "";
+                if (gain > 0f)
+                {
+                    applied = TorResourceBridge.TryAddDarkEnergy(Hero.MainHero, gain, out addReason);
+                }
+
+                string perKillStr = perKill.ToString("0.###", CultureInfo.InvariantCulture);
+                string gainStr = gain.ToString("0.###", CultureInfo.InvariantCulture);
+
+                var msg = string.Format(
+                    "[NecroQoL] Battle ended. Souls(kills)={0}, DE/kill={1}, DE gain={2}, applied={3}{4}{5}",
+                    kills,
+                    perKillStr,
+                    gainStr,
+                    applied ? "True" : "False",
+                    torOk ? string.Empty : " (fallback)",
+                    string.IsNullOrEmpty(why) ? string.Empty : " reason=" + why);
+
+                if (!applied && !string.IsNullOrEmpty(addReason))
+                    msg += " add=" + addReason;
+
+                Logger.Info(msg);
+            }
+            catch (Exception ex)
+            {
+                Logger.Info("[OnMapEventEnded EX] " + ex);
+            }
+        }
 
         private void OnSessionLaunched(CampaignGameStarter starter)
         {
@@ -127,27 +175,20 @@ namespace TorNecroQoL
             }
 
             var orig = _torOriginalRaiseConsequence;
-            if (orig != null)
+            if (orig == null)
+            {
+                if (DEBUG_RAISE_DIAGNOSTICS) TorCoreApi.DumpGraveyardRaiseDiagnostics(s);
+                return;
+            }
+
+            try
             {
                 orig.DynamicInvoke(args);
             }
-            else
+            catch (Exception ex)
             {
-                var fallback = TorCoreApi.TryCalculateRaiseDeadTroopsFromGraveyard(s, party);
-                if (fallback == null || fallback.TotalManCount == 0)
-                {
-                    if (DEBUG_RAISE_DIAGNOSTICS) TorCoreApi.DumpGraveyardRaiseDiagnostics(s);
-                    MBInformationManager.AddQuickInformation(new TextObject("{=tor_none_to_raise}No corpses answer your call."));
-                    return;
-                }
-
-                var fl = fallback.GetTroopRoster();
-                for (int i = 0; i < fl.Count; i++)
-                {
-                    var e = fl[i];
-                    if (e.Character != null && e.Number > 0)
-                        party.MemberRoster.AddToCounts(e.Character, e.Number);
-                }
+                Logger.Info("[Graveyard orig consequence EX] " + ex);
+                return;
             }
 
             var delta = TroopRoster.CreateDummyTroopRoster();
@@ -161,11 +202,7 @@ namespace TorNecroQoL
                 if (added > 0) delta.AddToCounts(e.Character, added);
             }
 
-            if (delta.TotalManCount <= 0)
-            {
-                MBInformationManager.AddQuickInformation(new TextObject("{=tor_none_to_raise}No corpses answer your call."));
-                return;
-            }
+            if (delta.TotalManCount <= 0) return;
 
             ShowRaisedDeadSelection_FromDelta(s, delta);
         }
@@ -306,24 +343,166 @@ namespace TorNecroQoL
 
         private static bool TryExplainedToInt(object val, out int result)
         {
-            result = 0;
-            if (val == null) return false;
-            var t = val.GetType();
-            var pRes = t.GetProperty("ResultNumber", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            return SafeToInt(val, out result);
+        }
+
+        private static bool SafeToInt(object value, out int number)
+        {
+            number = 0;
+            if (value == null) return false;
+
+            switch (value)
+            {
+                case int i: number = i; return true;
+                case long l when l <= int.MaxValue && l >= int.MinValue: number = (int)l; return true;
+                case short s: number = s; return true;
+                case byte b: number = b; return true;
+                case sbyte sb: number = sb; return true;
+            }
+
+            if (value is double d) { number = (int)Math.Floor(d); return true; }
+            if (value is float f) { number = (int)Math.Floor(f); return true; }
+            if (value is decimal m) { number = (int)Math.Floor((double)m); return true; }
+
+            if (value is string str && int.TryParse(str, out var parsedStr))
+            {
+                number = parsedStr;
+                return true;
+            }
+
+            var t = value.GetType();
+            var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            var pRes = t.GetProperty("ResultNumber", flags);
             if (pRes != null)
             {
-                var v = pRes.GetValue(val, null);
-                if (v is float f) { result = (int)Math.Floor(f); return true; }
-                if (v is int i) { result = i; return true; }
+                var inner = pRes.GetValue(value, null);
+                if (!ReferenceEquals(inner, value) && SafeToFloat(inner, out var rf))
+                {
+                    number = (int)Math.Floor(rf);
+                    return true;
+                }
             }
-            var pVal = t.GetProperty("Value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+            var pVal = t.GetProperty("Value", flags);
             if (pVal != null)
             {
-                var v2 = pVal.GetValue(val, null);
-                if (v2 is float f2) { result = (int)Math.Floor(f2); return true; }
-                if (v2 is int i2) { result = i2; return true; }
+                var inner = pVal.GetValue(value, null);
+                if (!ReferenceEquals(inner, value) && SafeToFloat(inner, out var rv))
+                {
+                    number = (int)Math.Floor(rv);
+                    return true;
+                }
             }
+
+            if (SafeToFloat(value, out var floatVal))
+            {
+                number = (int)Math.Floor(floatVal);
+                return true;
+            }
+
             return false;
+        }
+
+        private static bool SafeToFloat(object value, out float number)
+        {
+            number = 0f;
+            if (value == null) return false;
+
+            switch (value)
+            {
+                case float f: number = f; return true;
+                case double d: number = (float)d; return true;
+                case decimal m: number = (float)m; return true;
+                case int i: number = i; return true;
+                case long l: number = l; return true;
+                case short s: number = s; return true;
+                case byte b: number = b; return true;
+                case sbyte sb: number = sb; return true;
+            }
+
+            if (value is string str)
+            {
+                if (float.TryParse(str, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var parsedFloat))
+                {
+                    number = parsedFloat;
+                    return true;
+                }
+                if (float.TryParse(str, out parsedFloat))
+                {
+                    number = parsedFloat;
+                    return true;
+                }
+            }
+
+            var t = value.GetType();
+            var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            var pRes = t.GetProperty("ResultNumber", flags);
+            if (pRes != null)
+            {
+                var inner = pRes.GetValue(value, null);
+                if (!ReferenceEquals(inner, value) && SafeToFloat(inner, out var rf))
+                {
+                    number = rf;
+                    return true;
+                }
+            }
+
+            var pVal = t.GetProperty("Value", flags);
+            if (pVal != null)
+            {
+                var inner = pVal.GetValue(value, null);
+                if (!ReferenceEquals(inner, value) && SafeToFloat(inner, out var rv))
+                {
+                    number = rv;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryCalcBattleGainCompat(MapEvent mapEvent, out int kills, out float perKill, out float gain, out string why)
+        {
+            kills = 0;
+            perKill = 0f;
+            gain = 0f;
+            why = string.Empty;
+
+            if (mapEvent == null)
+            {
+                why = "no-event";
+                return false;
+            }
+
+            kills = Math.Max(0, TorResourceBridge.CountTotalDeaths(mapEvent));
+
+            float torAmount;
+            string reason;
+            bool torOk = TorResourceBridge.TryCalcBattleGain(mapEvent, out torAmount, out reason);
+
+            if (torOk)
+            {
+                gain = Math.Max(0f, torAmount);
+                perKill = kills > 0 ? gain / kills : gain;
+                why = "tor";
+                return true;
+            }
+
+            if (!string.IsNullOrEmpty(reason))
+                why = reason;
+
+            gain = kills;
+            perKill = kills > 0 ? gain / kills : 0f;
+            return false;
+        }
+
+        // Back-compat overload (older code expected no perKill)
+        internal static bool TryCalcBattleGainCompat(MapEvent mapEvent, out int kills, out float gain, out string why)
+        {
+            float perKill;
+            return TryCalcBattleGainCompat(mapEvent, out kills, out perKill, out gain, out why);
         }
 
         private static IDictionary<string, GameMenu> GetMenusDictionary(object gmm)
