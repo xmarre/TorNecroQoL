@@ -38,5 +38,12 @@ namespace TorNecroQoL
             }
             catch (Exception ex) { Logger.Info("[SubModule EX] " + ex); }
         }
+
+        public override void OnMissionBehaviorInitialize(Mission mission)
+        {
+            base.OnMissionBehaviorInitialize(mission);
+            if (mission != null)
+                mission.AddMissionBehavior(new TorNecroQoL.TNQ_PlayerKillTracker());
+        }
     }
 }

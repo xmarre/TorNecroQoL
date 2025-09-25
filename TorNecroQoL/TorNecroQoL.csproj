@@ -83,6 +83,7 @@
     <Compile Include="Logger.cs" />
     <Compile Include="TorIntrospect.cs" />
     <Compile Include="TorNecroQoLBehavior.cs" />
+    <Compile Include="TNQ_PlayerKillTracker.cs" />
     <Compile Include="SubModule.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="TorResourceBridge.cs" />
