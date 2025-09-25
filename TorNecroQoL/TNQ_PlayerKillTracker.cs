@@ -1,4 +1,5 @@
 // TNQ_PlayerKillTracker.cs
+using TaleWorlds.Core;
 using TaleWorlds.MountAndBlade;
 using TaleWorlds.CampaignSystem;
 
@@ -53,7 +54,7 @@ namespace TorNecroQoL
             }
         }
 
-        public override void OnMissionEnded()
+        public override void OnEndMission()
         {
             TNQ_KillSnapshot.LastMissionPlayerKills = _playerKills;
         }
