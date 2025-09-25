@@ -20,7 +20,7 @@ namespace TorNecroQoL
     public sealed class TorNecroQoLBehavior : CampaignBehaviorBase
     {
         // enable to print exact gates that block graveyard raising
-        private const bool DEBUG_RAISE_DIAGNOSTICS = false;
+        private static readonly bool DEBUG_RAISE_DIAGNOSTICS = false;
         private bool _graveyardPatched;
         private Delegate _torOriginalRaiseConsequence;
 
