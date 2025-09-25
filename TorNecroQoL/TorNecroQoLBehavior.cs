@@ -545,21 +545,64 @@ namespace TorNecroQoL
                 if (me == null || Hero.MainHero == null) return 0;
                 var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
                 int total = 0;
+                var mainHero = Hero.MainHero;
+                var mainChar = mainHero.CharacterObject;
 
-                // Scan all public/non-public properties/fields that are IEnumerable-like combat logs
-                System.Collections.Generic.IEnumerable<object> Enumerate(object maybeEnum)
+                IEnumerable<object> Enumerate(object maybeEnum)
                 {
                     if (maybeEnum is System.Collections.IEnumerable en)
                         foreach (var x in en) if (x != null) yield return x;
                 }
 
-                int ExtractCountFromItem(object item)
+                bool IsMainHero(object obj)
                 {
-                    // If grouped entries exist, try common numeric names without guessing exact ones:
-                    // prefer: Count/Number/Amount/Value/ResultNumber; else default 1 per entry.
+                    if (obj == null) return false;
+                    // Direct hero
+                    if (obj is Hero h) return ReferenceEquals(h, mainHero);
+                    // CharacterObject or BasicCharacterObject with HeroObject
+                    var t = obj.GetType();
+                    if (obj is CharacterObject co) return ReferenceEquals(co, mainChar) || ReferenceEquals(co.HeroObject, mainHero);
+                    var pHeroObj = t.GetProperty("HeroObject", flags);
+                    if (pHeroObj != null && pHeroObj.PropertyType == typeof(Hero))
+                    {
+                        var ho = pHeroObj.GetValue(obj, null) as Hero;
+                        if (ReferenceEquals(ho, mainHero)) return true;
+                    }
+                    return false;
+                }
+
+                bool LooksLikeAssistOnly(object item, Type t)
+                {
+                    // Common assist signals; if any true and killer isn't main hero we skip counting this entry.
+                    var pAssist = t.GetProperty("IsAssist", flags);
+                    if (pAssist != null && pAssist.PropertyType == typeof(bool))
+                        return (bool)pAssist.GetValue(item, null);
+                    // Presence of an Assister/Assistant hero while killer isn’t player: treat as assist-only
+                    var pAssister = t.GetProperty("AssisterHero", flags) ?? t.GetProperty("AssistantHero", flags);
+                    if (pAssister != null && pAssister.PropertyType == typeof(Hero))
+                    {
+                        var ass = pAssister.GetValue(item, null) as Hero;
+                        if (ass != null && !ReferenceEquals(ass, mainHero)) return true;
+                    }
+                    return false;
+                }
+
+                bool IsMainHeroAgent(object a)
+                {
+                    if (a == null) return false;
+                    var t = a.GetType();
+                    var ch = t.GetProperty("Character", flags)?.GetValue(a, null);
+                    if (ch == null) return false;
+                    var ct = ch.GetType();
+                    var ho = ct.GetProperty("HeroObject", flags)?.GetValue(ch, null) as Hero;
+                    return ReferenceEquals(ho, mainHero);
+                }
+
+                int ExtractCount(object item)
+                {
                     if (item == null) return 1;
                     var t = item.GetType();
-                    string[] names = { "Count", "Number", "Amount", "Value", "ResultNumber" };
+                    string[] names = { "Count", "Number", "Amount", "Value", "ResultNumber", "Kills", "KillCount", "KillsCount" };
                     foreach (var n in names)
                     {
                         var p = t.GetProperty(n, flags);
@@ -570,71 +613,101 @@ namespace TorNecroQoL
                     return 1;
                 }
 
-                bool ItemKilledByPlayer(object item)
+                bool EntryKilledByPlayer(object item)
                 {
                     var t = item.GetType();
-                    // Any property/field of type Hero equal to Hero.MainHero counts it as a kill by player.
+
+                    // direct killer hero/char on the entry
                     foreach (var p in t.GetProperties(flags))
-                    {
-                        var pt = p.PropertyType;
-                        if (typeof(Hero).IsAssignableFrom(pt))
-                        {
-                            var h = p.GetValue(item, null) as Hero;
-                            if (h == Hero.MainHero) return true;
-                        }
-                    }
+                        if (typeof(Hero).IsAssignableFrom(p.PropertyType) || typeof(CharacterObject).IsAssignableFrom(p.PropertyType))
+                            if (IsMainHero(p.GetValue(item, null))) return true;
+
                     foreach (var f in t.GetFields(flags))
+                        if (typeof(Hero).IsAssignableFrom(f.FieldType) || typeof(CharacterObject).IsAssignableFrom(f.FieldType))
+                            if (IsMainHero(f.GetValue(item))) return true;
+
+                    string[] agentNames = { "KillerAgent", "AttackerAgent", "Agent", "Killer" };
+                    foreach (var n in agentNames)
                     {
-                        var ft = f.FieldType;
-                        if (typeof(Hero).IsAssignableFrom(ft))
-                        {
-                            var h = f.GetValue(item) as Hero;
-                            if (h == Hero.MainHero) return true;
-                        }
+                        var p = t.GetProperty(n, flags);
+                        if (p != null && IsMainHeroAgent(p.GetValue(item, null))) return true;
+                        var f = t.GetField(n, flags);
+                        if (f != null && IsMainHeroAgent(f.GetValue(item))) return true;
                     }
+
+                    // nested under Killer*/Attacker* containers (one level deep)
+                    IEnumerable<MemberInfo> killerish =
+                        t.GetProperties(flags).Cast<MemberInfo>()
+                         .Concat(t.GetFields(flags))
+                         .Where(m => m.Name.IndexOf("Killer", StringComparison.OrdinalIgnoreCase) >= 0
+                                  || m.Name.IndexOf("Attacker", StringComparison.OrdinalIgnoreCase) >= 0);
+
+                    foreach (var m in killerish)
+                    {
+                        object box = null;
+                        switch (m)
+                        {
+                            case PropertyInfo pi: box = pi.GetValue(item, null); break;
+                            case FieldInfo fi:    box = fi.GetValue(item);       break;
+                        }
+                        if (box == null) continue;
+
+                        var bt = box.GetType();
+                        // if the box itself is hero/character
+                        if (IsMainHero(box)) return true;
+
+                        // or it contains hero/character inside
+                        foreach (var p in bt.GetProperties(flags))
+                            if (typeof(Hero).IsAssignableFrom(p.PropertyType) || typeof(CharacterObject).IsAssignableFrom(p.PropertyType))
+                                if (IsMainHero(p.GetValue(box, null))) return true;
+
+                        foreach (var f in bt.GetFields(flags))
+                            if (typeof(Hero).IsAssignableFrom(f.FieldType) || typeof(CharacterObject).IsAssignableFrom(f.FieldType))
+                                if (IsMainHero(f.GetValue(box))) return true;
+                    }
+
                     return false;
                 }
 
+                // Gather likely logs; if none, scan all enumerable members on MapEvent
+                var flagsAll = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
                 var tme = me.GetType();
-                // Probe obvious collections first; if not found, fall back to scanning everything enumerable.
-                string[] maybeLogs = { "CombatResults", "Casualties", "CasualtyLog", "BattleLog", "IndividualResults", "Events" };
+                string[] maybeLogs = { "CombatResults", "Casualties", "CasualtyLog", "BattleLog", "IndividualResults", "Events", "ResultList", "KillLog" };
                 var sources = new List<object>();
                 foreach (var name in maybeLogs)
                 {
-                    var p = tme.GetProperty(name, flags); if (p != null) sources.Add(p.GetValue(me, null));
-                    var f = tme.GetField(name, flags);    if (f != null) sources.Add(f.GetValue(me));
+                    var p = tme.GetProperty(name, flagsAll); if (p != null) sources.Add(p.GetValue(me, null));
+                    var f = tme.GetField(name,   flagsAll);  if (f != null) sources.Add(f.GetValue(me));
                 }
                 if (sources.Count == 0)
                 {
-                    // Fallback: scan *all* enumerable properties/fields on MapEvent
-                    foreach (var p in tme.GetProperties(flags))
-                    {
-                        object val = null;
-                        try { val = p.GetValue(me, null); }
-                        catch { }
-                        if (val is System.Collections.IEnumerable)
-                            sources.Add(val);
-                    }
-                    foreach (var f in tme.GetFields(flags))
-                    {
-                        object val = null;
-                        try { val = f.GetValue(me); }
-                        catch { }
-                        if (val is System.Collections.IEnumerable)
-                            sources.Add(val);
-                    }
+                    foreach (var p in tme.GetProperties(flagsAll))
+                        try { var v = p.GetValue(me, null); if (v is System.Collections.IEnumerable) sources.Add(v); } catch { }
+                    foreach (var f in tme.GetFields(flagsAll))
+                        try { var v = f.GetValue(me);       if (v is System.Collections.IEnumerable) sources.Add(v); } catch { }
                 }
 
                 foreach (var src in sources)
+                {
                     foreach (var entry in Enumerate(src))
-                        if (ItemKilledByPlayer(entry))
-                            total += ExtractCountFromItem(entry);
+                    {
+                        var t = entry.GetType();
+
+                        // check killer FIRST
+                        if (EntryKilledByPlayer(entry))
+                        {
+                            total += ExtractCount(entry);
+                            continue;
+                        }
+
+                        // only skip if it’s an assist and NOT the player’s kill
+                        if (LooksLikeAssistOnly(entry, t))
+                            continue;
+                    }
+                }
                 return total;
             }
-            catch
-            {
-                return 0;
-            }
+            catch { return 0; }
         }
 
         private static IDictionary<string, GameMenu> GetMenusDictionary(object gmm)
