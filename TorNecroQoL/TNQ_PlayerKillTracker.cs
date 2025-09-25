@@ -46,7 +46,7 @@ namespace TorNecroQoL
                 _playerKills++;
                 return;
             }
-            var hero = killer.Character?.HeroObject;
+            var hero = (killer.Character as CharacterObject)?.HeroObject;
             if (hero != null && ReferenceEquals(hero, Hero.MainHero))
             {
                 if (affected.Team != null && killer.Team != null && !affected.Team.IsEnemyOf(killer.Team)) return;
@@ -54,7 +54,7 @@ namespace TorNecroQoL
             }
         }
 
-        public override void OnEndMission()
+        protected override void OnEndMission()
         {
             TNQ_KillSnapshot.LastMissionPlayerKills = _playerKills;
         }
